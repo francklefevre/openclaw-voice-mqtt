@@ -93,8 +93,9 @@ class AudioPlayer:
 class VoiceOutSubscriber:
     """Subscribe to MQTT and play incoming text as speech."""
 
-    def __init__(self, broker: str, topic: str, tts: OpenAITTS, player: AudioPlayer):
+    def __init__(self, broker: str, topic: str, topic_prefix: str, tts: OpenAITTS, player: AudioPlayer):
         self.topic = topic
+        self.mute_topic = f"{topic_prefix}/voice/mute"
         self.tts = tts
         self.player = player
 
@@ -140,9 +141,15 @@ class VoiceOutSubscriber:
                 try:
                     pcm = self.tts.synthesize(t)
                     print(f"  ▶️  Playing ({len(pcm)} bytes)")
+                    # Mute voice-in before playback to prevent audio loop
+                    self.client.publish(self.mute_topic, json.dumps({"muted": True}))
                     self.player.play(pcm)
+                    # Unmute voice-in after playback
+                    self.client.publish(self.mute_topic, json.dumps({"muted": False}))
                     print(f"  ✅ Done")
                 except Exception as e:
+                    # Always unmute on error
+                    self.client.publish(self.mute_topic, json.dumps({"muted": False}))
                     print(f"  ❌ TTS/playback error: {e}", file=sys.stderr)
 
             threading.Thread(target=do_speak, args=(text,), daemon=True).start()
@@ -191,6 +198,7 @@ def main():
     subscriber = VoiceOutSubscriber(
         broker=mqtt_cfg.get("broker", "mqtt://localhost"),
         topic=reply_topic,
+        topic_prefix=topic_prefix,
         tts=tts,
         player=player,
     )

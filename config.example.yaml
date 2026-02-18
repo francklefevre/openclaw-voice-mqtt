@@ -21,3 +21,7 @@ vad:
 audio:
   input_device: null
   output_device: null
+
+wakeword:
+  enabled: true
+  model: "hey_jarvis"

@@ -2,6 +2,10 @@
 """
 voice-in: Capture audio from microphone, detect speech via VAD,
 transcribe with ASR (Whisper), and publish text to MQTT.
+
+Supports:
+- Anti-loop muting (subscribes to voice/mute topic)
+- Wake word detection via OpenWakeWord (optional)
 """
 
 import io
@@ -27,7 +31,6 @@ def load_config() -> dict:
         if path.exists():
             with open(path) as f:
                 cfg = yaml.safe_load(f)
-            # Expand env vars in string values
             _expand_env(cfg)
             return cfg
     print("ERROR: No config.yaml found. Copy config.example.yaml to config.yaml")
@@ -69,13 +72,41 @@ class SileroVAD:
         tensor = torch.from_numpy(audio_chunk).float()
         if tensor.dim() > 1:
             tensor = tensor.mean(dim=1)
-        # Silero VAD expects 512 samples at 16kHz (32ms)
         confidence = self.model(tensor, self.sample_rate).item()
         return confidence > 0.5
 
     def reset(self):
         """Reset VAD state between utterances."""
         self.model.reset_states()
+
+
+# ── Wake Word (OpenWakeWord) ────────────────────────────────────────────────
+
+class WakeWordDetector:
+    """Wake word detection using OpenWakeWord."""
+
+    def __init__(self, model_name: str = "hey_jarvis", sample_rate: int = 16000):
+        from openwakeword.model import Model
+        self.model = Model(wakeword_models=[model_name])
+        self.model_name = model_name
+        self.sample_rate = sample_rate
+        self.threshold = 0.5
+
+    def detect(self, audio_chunk: np.ndarray) -> bool:
+        """Check if the wake word is detected in the audio chunk.
+        OpenWakeWord expects int16 samples at 16kHz."""
+        audio_int16 = (audio_chunk * 32767).astype(np.int16)
+        prediction = self.model.predict(audio_int16)
+        # Check all model keys for activation
+        for key in prediction:
+            if prediction[key] > self.threshold:
+                self.model.reset()
+                return True
+        return False
+
+    def reset(self):
+        """Reset detector state."""
+        self.model.reset()
 
 
 # ── ASR (Whisper API) ───────────────────────────────────────────────────────
@@ -91,13 +122,11 @@ class WhisperASR:
 
     def transcribe(self, audio_data: np.ndarray, sample_rate: int) -> str:
         """Transcribe audio data to text."""
-        # Convert to WAV in memory
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
             wf.setnchannels(1)
-            wf.setsampwidth(2)  # 16-bit
+            wf.setsampwidth(2)
             wf.setframerate(sample_rate)
-            # Convert float32 [-1, 1] to int16
             audio_int16 = (audio_data * 32767).astype(np.int16)
             wf.writeframes(audio_int16.tobytes())
         buf.seek(0)
@@ -114,11 +143,14 @@ class WhisperASR:
 # ── MQTT Publisher ──────────────────────────────────────────────────────────
 
 class MQTTPublisher:
-    """Publish transcribed text to MQTT."""
+    """Publish transcribed text to MQTT and subscribe to mute topic."""
 
     def __init__(self, broker: str, topic_prefix: str):
         self.topic_in = f"{topic_prefix}/in"
         self.reply_topic = f"{topic_prefix}/voice/out"
+        self.mute_topic = f"{topic_prefix}/voice/mute"
+        self.muted = False
+        self._mute_lock = threading.Lock()
 
         # Parse broker URL
         broker_clean = broker.replace("mqtt://", "").replace("mqtts://", "")
@@ -130,11 +162,35 @@ class MQTTPublisher:
             client_id=f"voice-in-{os.getpid()}",
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
         )
+        self.client.on_connect = self._on_connect
+        self.client.on_message = self._on_message
         self.client.connect(host, port)
         self.client.loop_start()
         print(f"MQTT connected to {host}:{port}")
         print(f"  Publishing to: {self.topic_in}")
         print(f"  Reply topic:   {self.reply_topic}")
+        print(f"  Mute topic:    {self.mute_topic}")
+
+    def _on_connect(self, client, userdata, flags, rc, properties=None):
+        """Subscribe to mute topic on (re)connect."""
+        client.subscribe(self.mute_topic)
+
+    def _on_message(self, client, userdata, msg):
+        """Handle mute/unmute messages."""
+        try:
+            payload = json.loads(msg.payload.decode("utf-8"))
+            muted = payload.get("muted", False)
+            with self._mute_lock:
+                self.muted = muted
+            state = "🔇 MUTED" if muted else "🔊 UNMUTED"
+            print(f"  {state} (anti-loop)")
+        except Exception as e:
+            print(f"  ⚠ Mute message error: {e}", file=sys.stderr)
+
+    @property
+    def is_muted(self) -> bool:
+        with self._mute_lock:
+            return self.muted
 
     def publish(self, text: str):
         """Publish transcribed text to MQTT."""
@@ -153,6 +209,11 @@ class MQTTPublisher:
 
 # ── Main Loop ───────────────────────────────────────────────────────────────
 
+# States for wake word mode
+STATE_IDLE = "IDLE"
+STATE_LISTENING = "LISTENING"
+
+
 def main():
     cfg = load_config()
 
@@ -160,16 +221,27 @@ def main():
     silence_ms = cfg.get("vad", {}).get("silence_threshold_ms", 1500)
     input_device = cfg.get("audio", {}).get("input_device", None)
 
+    # Wake word config
+    ww_cfg = cfg.get("wakeword", {})
+    wakeword_enabled = ww_cfg.get("enabled", False)
+    wakeword_model = ww_cfg.get("model", "hey_jarvis")
+
     print("═══════════════════════════════════════════")
     print("  voice-in 🎙️  — OpenClaw Voice Frontend")
     print("═══════════════════════════════════════════")
-    print(f"  Sample rate:      {sample_rate} Hz")
+    print(f"  Sample rate:       {sample_rate} Hz")
     print(f"  Silence threshold: {silence_ms} ms")
+    print(f"  Wake word:         {'ON (' + wakeword_model + ')' if wakeword_enabled else 'OFF'}")
     print()
 
     # Init components
     print("Loading VAD model...")
     vad = SileroVAD(sample_rate=sample_rate)
+
+    wakeword_detector = None
+    if wakeword_enabled:
+        print(f"Loading wake word model ({wakeword_model})...")
+        wakeword_detector = WakeWordDetector(model_name=wakeword_model, sample_rate=sample_rate)
 
     print("Initializing ASR...")
     asr_cfg = cfg.get("asr", {})
@@ -187,7 +259,7 @@ def main():
     )
 
     # VAD parameters
-    chunk_duration_ms = 32  # Silero VAD expects 32ms chunks at 16kHz
+    chunk_duration_ms = 32
     chunk_samples = int(sample_rate * chunk_duration_ms / 1000)
     silence_chunks = int(silence_ms / chunk_duration_ms)
 
@@ -195,20 +267,39 @@ def main():
     is_speaking = False
     silence_count = 0
     audio_buffer = []
+    state = STATE_IDLE if wakeword_enabled else STATE_LISTENING
 
     print()
-    print("🎤 Listening... (Ctrl+C to stop)")
+    if wakeword_enabled:
+        print(f"🎤 Waiting for wake word... (Ctrl+C to stop)")
+    else:
+        print("🎤 Listening... (Ctrl+C to stop)")
     print()
 
     def audio_callback(indata, frames, time_info, status):
-        nonlocal is_speaking, silence_count, audio_buffer
+        nonlocal is_speaking, silence_count, audio_buffer, state
 
         if status:
             print(f"  ⚠ Audio: {status}", file=sys.stderr)
 
+        # Ignore audio when muted (voice-out is playing)
+        if publisher.is_muted:
+            return
+
         audio = indata[:, 0].copy()  # mono
 
-        # Check for speech
+        # ── IDLE state: only listen for wake word ──
+        if state == STATE_IDLE and wakeword_detector is not None:
+            if wakeword_detector.detect(audio):
+                print("  🔔 Wake word detected!")
+                state = STATE_LISTENING
+                is_speaking = False
+                silence_count = 0
+                audio_buffer = []
+                vad.reset()
+            return
+
+        # ── LISTENING state: VAD + ASR ──
         if len(audio) >= chunk_samples:
             speech_detected = vad.is_speech(audio[:chunk_samples])
         else:
@@ -226,12 +317,11 @@ def main():
             silence_count += 1
 
             if silence_count >= silence_chunks:
-                # End of utterance — transcribe
                 print("  ✋ Silence detected — transcribing...")
                 full_audio = np.concatenate(audio_buffer)
 
-                # Transcribe in a separate thread to not block audio
                 def do_transcribe(audio_data):
+                    nonlocal state
                     try:
                         text = asr.transcribe(audio_data, sample_rate)
                         if text:
@@ -241,6 +331,11 @@ def main():
                             print("  (empty transcription)")
                     except Exception as e:
                         print(f"  ❌ ASR error: {e}", file=sys.stderr)
+                    finally:
+                        # Return to IDLE if wake word is enabled
+                        if wakeword_enabled:
+                            state = STATE_IDLE
+                            print("  💤 Back to IDLE — waiting for wake word...")
 
                 threading.Thread(
                     target=do_transcribe,
@@ -263,7 +358,6 @@ def main():
             device=input_device,
             callback=audio_callback,
         ):
-            # Keep main thread alive
             threading.Event().wait()
     except KeyboardInterrupt:
         print("\n👋 Stopping...")
