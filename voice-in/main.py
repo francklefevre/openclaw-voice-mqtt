@@ -87,7 +87,7 @@ class WakeWordDetector:
 
     def __init__(self, model_name: str = "hey_jarvis", sample_rate: int = 16000):
         from openwakeword.model import Model
-        self.model = Model(wakeword_models=[model_name])
+        self.model = Model(wakeword_models=[model_name], inference_framework="onnx")
         self.model_name = model_name
         self.sample_rate = sample_rate
         self.threshold = 0.5
