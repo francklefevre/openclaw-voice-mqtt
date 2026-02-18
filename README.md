@@ -36,8 +36,12 @@ Talk to your OpenClaw assistant with your voice — from a PC, Raspberry Pi, or 
 ### Install
 
 ```bash
+pip install openwakeword --no-deps
 pip install -r requirements.txt
 ```
+
+> **Note:** `openwakeword` requires `tflite-runtime` which doesn't support Python 3.12+ on Linux.
+> Installing it with `--no-deps` and using `onnxruntime` instead works fine.
 
 ### Configure
 
