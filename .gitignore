@@ -7,3 +7,7 @@ venv/
 dist/
 build/
 .env
+*.wav
+*.mp3
+*.log
+.DS_Store
