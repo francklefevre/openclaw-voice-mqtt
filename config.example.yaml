@@ -1,0 +1,23 @@
+mqtt:
+  broker: "mqtt://k1tests.k1info.com"
+  topic_prefix: "123456/openclaw"
+
+asr:
+  provider: "openai"
+  openai_api_key: "${OPENAI_API_KEY}"
+  model: "whisper-1"
+  language: "fr"
+
+tts:
+  provider: "openai"
+  openai_api_key: "${OPENAI_API_KEY}"
+  model: "tts-1"
+  voice: "nova"
+
+vad:
+  silence_threshold_ms: 1500
+  sample_rate: 16000
+
+audio:
+  input_device: null
+  output_device: null

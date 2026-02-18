@@ -1,0 +1,9 @@
+config.yaml
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.env
