@@ -19,7 +19,6 @@ from pathlib import Path
 import numpy as np
 import paho.mqtt.client as mqtt
 import sounddevice as sd
-import torch
 import yaml
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -56,28 +55,38 @@ def _expand_env(obj):
 # ── VAD (Silero) ────────────────────────────────────────────────────────────
 
 class SileroVAD:
-    """Voice Activity Detection using Silero VAD."""
+    """Voice Activity Detection using Silero VAD (ONNX Runtime)."""
 
     def __init__(self, sample_rate: int = 16000):
+        import onnxruntime as ort
         self.sample_rate = sample_rate
-        self.model, self.utils = torch.hub.load(
-            repo_or_dir="snakers4/silero-vad",
-            model="silero_vad",
-            trust_repo=True,
+        model_path = Path(__file__).parent / "models" / "silero_vad.onnx"
+        opts = ort.SessionOptions()
+        opts.inter_op_num_threads = 1
+        opts.intra_op_num_threads = 1
+        self.session = ort.InferenceSession(
+            str(model_path),
+            providers=["CPUExecutionProvider"],
+            sess_options=opts,
         )
-        self.model.eval()
+        self._state = np.zeros((2, 1, 128), dtype=np.float32)
 
     def is_speech(self, audio_chunk: np.ndarray) -> bool:
         """Check if an audio chunk contains speech."""
-        tensor = torch.from_numpy(audio_chunk).float()
-        if tensor.dim() > 1:
-            tensor = tensor.mean(dim=1)
-        confidence = self.model(tensor, self.sample_rate).item()
-        return confidence > 0.5
+        if audio_chunk.ndim > 1:
+            audio_chunk = audio_chunk.mean(axis=1)
+        x = audio_chunk.astype(np.float32).reshape(1, -1)
+        out = self.session.run(None, {
+            "input": x,
+            "sr": np.array(self.sample_rate, dtype=np.int64),
+            "state": self._state,
+        })
+        confidence, self._state = out[0], out[1]
+        return float(confidence) > 0.5
 
     def reset(self):
         """Reset VAD state between utterances."""
-        self.model.reset_states()
+        self._state = np.zeros((2, 1, 128), dtype=np.float32)
 
 
 # ── Wake Word (OpenWakeWord) ────────────────────────────────────────────────
