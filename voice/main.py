@@ -406,7 +406,7 @@ def main():
     print(f"  Silence threshold: {silence_ms} ms")
     print(f"  VAD threshold:     {vad_threshold}")
     # Interrupt needs N consecutive speech chunks (~N*32ms) to trigger
-    interrupt_threshold = vad_cfg.get("interrupt_chunks", 15)  # ~480ms of sustained speech
+    interrupt_threshold = vad_cfg.get("interrupt_chunks", 45)  # ~1.4s of sustained speech
 
     print(f"  Wake word:         {'ON (' + wakeword_model + ')' if wakeword_enabled else 'OFF'}")
     print(f"  Interrupt after:   {interrupt_threshold} chunks (~{interrupt_threshold * 32}ms of speech)")
