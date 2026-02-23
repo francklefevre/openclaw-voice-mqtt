@@ -1,5 +1,5 @@
 mqtt:
-  broker: "mqtt://k1tests.k1info.com"
+  broker: "mqtt://your-broker.example.com"
   topic_prefix: "123456/openclaw"
 
 asr:
