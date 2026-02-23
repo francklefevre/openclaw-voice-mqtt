@@ -4,3 +4,8 @@ sounddevice>=0.4.6
 numpy>=1.24.0
 pyyaml>=6.0
 onnxruntime>=1.16.0
+# openwakeword deps (installed with --no-deps to skip tflite-runtime)
+requests
+scipy
+scikit-learn
+tqdm

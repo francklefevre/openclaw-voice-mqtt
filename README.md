@@ -1,5 +1,3 @@
-<![CDATA[<div align="center">
-
 # 🎙️ openclaw-voice-mqtt
 
 **Voice frontend for OpenClaw — talk to your AI assistant via MQTT**
