@@ -85,12 +85,17 @@ def resolve_audio_device(configured, kind="input"):
 # ── VAD (Silero) ────────────────────────────────────────────────────────────
 
 class SileroVAD:
-    """Voice Activity Detection using Silero VAD (ONNX Runtime)."""
+    """Voice Activity Detection using Silero VAD (ONNX Runtime).
 
-    def __init__(self, sample_rate: int = 16000, threshold: float = 0.3):
+    Matches the official OnnxWrapper: each 512-sample chunk is prefixed
+    with a 64-sample context window before being fed to the model.
+    """
+
+    def __init__(self, sample_rate: int = 16000, threshold: float = 0.5):
         import onnxruntime as ort
         self.sample_rate = sample_rate
         self.threshold = threshold
+        self._context_size = 64 if sample_rate == 16000 else 32
         model_path = Path(__file__).parent / "models" / "silero_vad.onnx"
         opts = ort.SessionOptions()
         opts.inter_op_num_threads = 1
@@ -100,7 +105,7 @@ class SileroVAD:
             providers=["CPUExecutionProvider"],
             sess_options=opts,
         )
-        self._state = np.zeros((2, 1, 128), dtype=np.float32)
+        self.reset()
 
     def is_speech(self, audio_chunk: np.ndarray) -> tuple[bool, float]:
         """Check if an audio chunk contains speech.
@@ -108,6 +113,9 @@ class SileroVAD:
         if audio_chunk.ndim > 1:
             audio_chunk = audio_chunk.mean(axis=1)
         x = audio_chunk.astype(np.float32).reshape(1, -1)
+        # Prepend context (last 64 samples of previous chunk)
+        x = np.concatenate([self._context, x], axis=1)
+        self._context = x[:, -self._context_size:]
         out = self.session.run(None, {
             "input": x,
             "sr": np.array(self.sample_rate, dtype=np.int64),
@@ -120,6 +128,7 @@ class SileroVAD:
     def reset(self):
         """Reset VAD state between utterances."""
         self._state = np.zeros((2, 1, 128), dtype=np.float32)
+        self._context = np.zeros((1, self._context_size), dtype=np.float32)
 
 
 # ── Wake Word (OpenWakeWord) ────────────────────────────────────────────────
