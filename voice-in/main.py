@@ -52,6 +52,27 @@ def _expand_env(obj):
                 _expand_env(v)
 
 
+# ── Audio device helper ────────────────────────────────────────────────────
+
+def resolve_audio_device(configured, kind="input"):
+    """Resolve audio device: try configured value, fall back to system default.
+    kind is 'input' or 'output'."""
+    if configured is not None:
+        try:
+            info = sd.query_devices(configured, kind)
+            print(f"  Audio {kind}: #{info['index']} — {info['name']}")
+            return configured
+        except ValueError:
+            print(f"  WARNING: {kind} device {configured!r} not found, falling back to default")
+    default = sd.default.device[0 if kind == "input" else 1]
+    try:
+        info = sd.query_devices(default, kind)
+        print(f"  Audio {kind}: #{info['index']} — {info['name']} (default)")
+    except Exception:
+        print(f"  Audio {kind}: system default (could not query details)")
+    return None
+
+
 # ── VAD (Silero) ────────────────────────────────────────────────────────────
 
 class SileroVAD:
@@ -241,6 +262,7 @@ def main():
     print(f"  Sample rate:       {sample_rate} Hz")
     print(f"  Silence threshold: {silence_ms} ms")
     print(f"  Wake word:         {'ON (' + wakeword_model + ')' if wakeword_enabled else 'OFF'}")
+    input_device = resolve_audio_device(input_device, "input")
     print()
 
     # Init components

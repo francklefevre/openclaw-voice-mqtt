@@ -48,6 +48,27 @@ def _expand_env(obj):
                 _expand_env(v)
 
 
+# ── Audio device helper ────────────────────────────────────────────────────
+
+def resolve_audio_device(configured, kind="output"):
+    """Resolve audio device: try configured value, fall back to system default.
+    kind is 'input' or 'output'."""
+    if configured is not None:
+        try:
+            info = sd.query_devices(configured, kind)
+            print(f"  Audio {kind}: #{info['index']} — {info['name']}")
+            return configured
+        except ValueError:
+            print(f"  WARNING: {kind} device {configured!r} not found, falling back to default")
+    default = sd.default.device[0 if kind == "input" else 1]
+    try:
+        info = sd.query_devices(default, kind)
+        print(f"  Audio {kind}: #{info['index']} — {info['name']} (default)")
+    except Exception:
+        print(f"  Audio {kind}: system default (could not query details)")
+    return None
+
+
 # ── TTS (OpenAI) ───────────────────────────────────────────────────────────
 
 class OpenAITTS:
@@ -175,6 +196,7 @@ def main():
     print("═══════════════════════════════════════════")
     print("  voice-out 🔊 — OpenClaw Voice Frontend")
     print("═══════════════════════════════════════════")
+    output_device = resolve_audio_device(output_device, "output")
     print()
 
     # Init TTS
