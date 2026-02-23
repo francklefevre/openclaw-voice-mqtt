@@ -8,8 +8,6 @@
 
 *Turn any device with a mic and speaker into a voice interface for [OpenClaw](https://github.com/openclaw/openclaw) — PC, Raspberry Pi, or anything that runs Python.*
 
-</div>
-
 ---
 
 ## 🏗️ Architecture
@@ -19,25 +17,25 @@
 │  Client (PC / Raspberry Pi)   │    MQTT      │  Server (VPS)            │
 │                               │              │                          │
 │  ┌─────────┐                  │              │                          │
-│  │voice-in │                  │              │                          │
-│  │         │                  │              │                          │
-│  │ Mic     │                  │  {prefix}/in │                          │
-│  │  → VAD  │                  ├─────text────►│  OpenClaw                │
-│  │  → ASR  │                  │              │  (MQTT channel plugin)   │
-│  │  → Wake │                  │              │                          │
+│  │voice-in │  {prefix}/in     │              │                          │
+│  │         ├─────text────────►│─────────────►│  OpenClaw                │
+│  │ Mic     │                  │              │  (MQTT channel plugin)   │
+│  │  → VAD  │                  │              │                          │
+│  │  → ASR  │                  │              │                          │
 │  └─────────┘                  │              │                          │
 │                               │              │                          │
-│  ┌─────────┐                  │              │                          │
-│  │voice-out│  {prefix}/voice/ │              │                          │
-│  │         │◄────text─────────┤◄─────────────┤                          │
-│  │ TTS     │       out        │              │                          │
+│  ┌─────────┐  {prefix}/voice/ │              │                          │
+│  │voice-out│◄────text─────────┤◄─────────────┤                          │
+│  │         │       out        │              │                          │
+│  │ TTS     │                  │              │                          │
 │  │  → Spkr │                  │              │                          │
 │  └─────────┘                  │              │                          │
 │                               │              │                          │
-│  ┌──── anti-loop ────┐        │              │                          │
-│  │ voice-out mutes   │        │              │                          │
-│  │ voice-in during   │  mute  │              │                          │
-│  │ TTS playback      ├───────►│              │                          │
+│  ┌──── duplex ───────┐        │              │                          │
+│  │ voice-in stays    │        │              │                          │
+│  │ active during TTS │ speak/ │              │                          │
+│  │ detects speech →  │ inter- │              │                          │
+│  │ sends interrupt   │ rupt   │              │                          │
 │  └───────────────────┘        │              │                          │
 └───────────────────────────────┘              └──────────────────────────┘
 ```
@@ -46,9 +44,20 @@
 
 | Component | Role |
 |-----------|------|
-| **voice-in** | Captures mic audio → VAD (Silero) → optional wake word → ASR (Whisper API) → publishes text to MQTT |
-| **voice-out** | Subscribes to MQTT reply topic → TTS (OpenAI) → plays audio on speaker |
-| **asr-worker** | *(future)* Local ASR server (whisper.cpp) for offline/low-latency transcription |
+| **voice-in** | Captures mic audio → VAD (Silero ONNX) → optional wake word → ASR (Whisper API) → publishes text to MQTT |
+| **voice-out** | Subscribes to MQTT reply topic → TTS (OpenAI streaming) → interruptible audio playback |
+
+---
+
+## ✨ Features
+
+- **Duplex conversation** — speak while the assistant is talking to interrupt it instantly
+- **Streaming TTS** — audio starts playing as soon as the first chunks arrive from OpenAI
+- **Silero VAD via ONNX Runtime** — lightweight voice activity detection, works on Raspberry Pi (no PyTorch needed)
+- **Wake word detection** — optional activation via OpenWakeWord (English models: "Hey Jarvis", "Alexa", etc.)
+- **PulseAudio support** — auto-detects PulseAudio/PipeWire for Bluetooth headset compatibility
+- **Auto-reconnect** — MQTT connection is monitored and restored automatically
+- **Runs on minimal hardware** — tested on Raspberry Pi 3 (1 GB RAM) with Bluetooth headset
 
 ---
 
@@ -56,19 +65,19 @@
 
 | Requirement | Details |
 |-------------|---------|
-| **Python** | 3.10 or higher (tested on 3.10, 3.11, 3.12, 3.13) |
+| **Python** | 3.10+ (tested on 3.10–3.13) |
 | **OS** | Linux (Ubuntu/Debian/Raspbian), macOS — Windows untested |
 | **MQTT broker** | [Mosquitto](https://mosquitto.org/) or any MQTT 3.1.1+ broker |
 | **OpenClaw** | With [MQTT channel plugin](https://github.com/openclaw/openclaw) configured |
 | **OpenAI API key** | For Whisper (ASR) and TTS |
-| **Audio hardware** | Microphone (for voice-in) and speaker (for voice-out) |
+| **Audio hardware** | Microphone + speaker (or Bluetooth headset) |
 | **System libs** | `portaudio19-dev` on Debian/Ubuntu (`sudo apt install portaudio19-dev`) |
 
 ---
 
 ## 🚀 Installation
 
-### 1. Clone the repository
+### 1. Clone
 
 ```bash
 git clone https://github.com/francklefevre/openclaw-voice-mqtt.git
@@ -81,188 +90,163 @@ cd openclaw-voice-mqtt
 ./setup.sh
 ```
 
-This creates a `.venv` virtual environment and installs all dependencies.
+Creates a `.venv` and installs everything. `openwakeword` is installed with `--no-deps` (uses `onnxruntime` instead of `tflite-runtime` for Python 3.12+ compatibility).
 
-> ⚠️ `openwakeword` is installed with `--no-deps` because it depends on `tflite-runtime`, which does not support Python 3.12+. `onnxruntime` is used as the inference backend instead.
-
-### 3. Download wake word models
+### 3. Download wake word models (optional)
 
 ```bash
 .venv/bin/python -c "from openwakeword import utils; utils.download_models()"
 ```
 
-This downloads the pre-trained ONNX models (including `hey_jarvis`, `alexa`, etc.) to `~/.local/share/openwakeword/`.
-
 ### 4. Configure
 
 ```bash
 cp config.example.yaml config.yaml
-nano config.yaml   # Edit with your settings
+nano config.yaml
 ```
 
 ---
 
 ## ⚙️ Configuration
 
-All settings live in `config.yaml`. Here's a complete reference:
+All settings in `config.yaml`:
 
 ```yaml
 # ── MQTT Broker ─────────────────────────────────────────────────
 mqtt:
-  broker: "mqtt://your-broker.example.com"   # MQTT broker URL (mqtt:// or mqtts://)
-  topic_prefix: "123456/openclaw"            # Prefix for all MQTT topics
-                                              # Must match your OpenClaw MQTT plugin config
+  broker: "mqtt://your-broker.example.com"
+  topic_prefix: "123456/openclaw"           # Must match OpenClaw MQTT plugin
 
 # ── ASR (Speech-to-Text) ───────────────────────────────────────
 asr:
-  provider: "openai"               # "openai" (local whisper.cpp planned)
-  openai_api_key: "${OPENAI_API_KEY}"  # Reads from environment variable
-  model: "whisper-1"               # OpenAI Whisper model
-  language: "fr"                   # ISO language code (fr, en, de, es...)
+  provider: "openai"
+  openai_api_key: "${OPENAI_API_KEY}"
+  model: "whisper-1"
+  language: "fr"                            # ISO language code
 
 # ── TTS (Text-to-Speech) ───────────────────────────────────────
 tts:
-  provider: "openai"               # "openai" (elevenlabs, piper planned)
+  provider: "openai"
   openai_api_key: "${OPENAI_API_KEY}"
-  model: "tts-1"                   # "tts-1" (fast) or "tts-1-hd" (quality)
-  voice: "nova"                    # alloy, echo, fable, onyx, nova, shimmer
+  model: "tts-1"                            # tts-1 (fast) or tts-1-hd (quality)
+  voice: "nova"                             # alloy, echo, fable, onyx, nova, shimmer
 
 # ── VAD (Voice Activity Detection) ─────────────────────────────
 vad:
-  silence_threshold_ms: 1500       # Milliseconds of silence before triggering ASR
-                                    # Lower = faster response, higher = fewer false cuts
-  sample_rate: 16000               # Audio sample rate in Hz (16000 recommended)
+  silence_threshold_ms: 1500                # ms of silence before triggering ASR
+  sample_rate: 16000
+  threshold: 0.3                            # VAD confidence threshold (0.0–1.0)
 
 # ── Audio Devices ───────────────────────────────────────────────
 audio:
-  input_device: null               # Mic device index (null = system default)
-  output_device: null              # Speaker device index (null = system default)
-                                    # Run `python -m sounddevice` to list devices
+  input_device: null                        # null = auto-detect (prefers PulseAudio)
+  output_device: null                       # Run `python -m sounddevice` to list
 
 # ── Wake Word Detection ────────────────────────────────────────
 wakeword:
-  enabled: true                    # true = require wake word before listening
-                                    # false = always listening (push-to-talk style)
-  model: "hey_jarvis"             # Model name: hey_jarvis, alexa, hey_mycroft, etc.
-                                    # See: https://github.com/dscripka/openWakeWord
+  enabled: false                            # true = require wake word before listening
+  model: "hey_jarvis"                       # hey_jarvis, alexa, hey_mycroft, etc.
 ```
 
-> 💡 **Tip:** Use `${ENV_VAR}` syntax for sensitive values. The config loader expands environment variables automatically.
+> 💡 Use `${ENV_VAR}` syntax for sensitive values — the config loader expands environment variables.
 
 ---
 
 ## ▶️ Quick Start
 
-### Step 1 — Start voice-out (the speaker)
-
 ```bash
+# Terminal 1 — speaker
 .venv/bin/python voice-out/main.py
-```
 
-This connects to MQTT and waits for text replies from OpenClaw to speak out loud.
-
-### Step 2 — Start voice-in (the microphone)
-
-In a second terminal:
-
-```bash
+# Terminal 2 — microphone
 .venv/bin/python voice-in/main.py
 ```
 
-This starts listening for your voice (or waiting for the wake word if enabled).
+Then just talk! Your speech is transcribed and sent to OpenClaw via MQTT. The response is spoken back through your speaker.
 
-> 💡 **Tip:** Or activate the venv first (`source .venv/bin/activate`) and use `python` directly.
-
-### Step 3 — Talk!
-
-- If wake word is enabled: say **"Hey Jarvis"**, then speak your question
-- If wake word is disabled: just start speaking
-
-Your speech is transcribed and sent to OpenClaw via MQTT. The response is spoken back through your speaker.
+If the assistant is speaking and you start talking, it will **stop immediately** and listen to you (duplex mode).
 
 ---
 
-## 🗣️ Wake Word Detection
+## 🔄 Duplex Conversation
 
-Wake word detection uses [OpenWakeWord](https://github.com/dscripka/openWakeWord) to activate voice-in only when a trigger phrase is spoken.
+The voice frontend supports **full duplex** — you can interrupt the assistant while it's speaking.
 
-### Available Models
+### How it works
 
-The pre-trained models are **English wake words**:
+1. **voice-out** publishes `{"speaking": true}` on `{prefix}/voice/speaking` when TTS starts
+2. **voice-in** stays active and monitors the microphone via VAD
+3. When voice-in detects speech during playback, it publishes `{"interrupt": true}` on `{prefix}/voice/interrupt`
+4. **voice-out** receives the interrupt and stops playback immediately (`sd.stop()`)
+5. **voice-out** publishes `{"speaking": false}` — voice-in resumes normal processing
 
-| Model | Trigger Phrase |
-|-------|---------------|
-| `hey_jarvis` | "Hey Jarvis" |
-| `alexa` | "Alexa" |
-| `hey_mycroft` | "Hey Mycroft" |
-| `timer` | Timer/alarm sounds |
-
-> 🇬🇧 **Note:** Wake word models are trained on English pronunciation. Even if your assistant speaks French, you'll need to say the wake word in English (e.g., "Hey Jarvis" with English pronunciation). Custom models in other languages can be trained — see the [OpenWakeWord docs](https://github.com/dscripka/openWakeWord).
-
-### Disabling Wake Word
-
-If you don't want wake word detection (always-listening mode), set:
-
-```yaml
-wakeword:
-  enabled: false
+```
+voice-in                          voice-out
+   │                                  │
+   │       speaking=true              │
+   │◄─────────────────────────────────┤ starts TTS playback
+   │  (still listening via VAD)       │ 🔊
+   │                                  │
+   │  🗣️ user speaks                 │
+   │  interrupt=true                  │
+   ├─────────────────────────────────►│ ⏹️ stops playback
+   │                                  │
+   │       speaking=false             │
+   │◄─────────────────────────────────┤
+   │                                  │
+   │  (processes speech normally)     │
 ```
 
-In this mode, voice-in listens continuously and transcribes whenever it detects speech.
+> 💡 **Bluetooth headsets** don't create feedback loops (the mic doesn't pick up speaker output), so no echo cancellation is needed.
 
 ---
 
-## 🔇 Anti-Loop Mechanism
+## 📨 MQTT Topics
 
-When voice-out plays audio through the speaker, voice-in would pick it up through the microphone, creating an infinite feedback loop. The anti-loop system prevents this:
-
-1. **Before playback:** voice-out publishes `{"muted": true}` to `{prefix}/voice/mute`
-2. **voice-in receives the mute message** and stops processing audio
-3. **After playback:** voice-out publishes `{"muted": false}`
-4. **voice-in resumes** listening
-
-This happens automatically — no configuration needed.
-
-```
-voice-out                          voice-in
-   │                                  │
-   │  publish mute=true               │
-   ├─────────────────────────────────►│ stops listening
-   │                                  │
-   │  🔊 plays TTS audio             │
-   │                                  │
-   │  publish mute=false              │
-   ├─────────────────────────────────►│ resumes listening
-   │                                  │
-```
+| Topic | Direction | Payload |
+|-------|-----------|---------|
+| `{prefix}/in` | voice-in → OpenClaw | `{"text": "...", "replyTopic": "{prefix}/voice/out", "sender": "voice-frontend"}` |
+| `{prefix}/voice/out` | OpenClaw → voice-out | `{"text": "...", "messageId": "mqtt-..."}` |
+| `{prefix}/voice/speaking` | voice-out → voice-in | `{"speaking": true/false}` |
+| `{prefix}/voice/interrupt` | voice-in → voice-out | `{"interrupt": true}` |
 
 ---
 
-## 📨 MQTT Message Format
+## 🍓 Raspberry Pi Setup
 
-### voice-in → OpenClaw (`{prefix}/in`)
+Tested on **Raspberry Pi 3** (1 GB RAM, Raspbian 64-bit) with a Bluetooth headset.
 
-```json
-{
-  "text": "Quelle heure est-il ?",
-  "replyTopic": "{prefix}/voice/out",
-  "sender": "voice-frontend"
-}
+### Key points
+
+- **No PyTorch** — Silero VAD runs via ONNX Runtime (the `silero_vad.onnx` model is embedded in `voice-in/models/`)
+- **PulseAudio required** for Bluetooth audio — the `pulse` device is auto-detected
+- **`openwakeword`** installed with `--no-deps` + `onnxruntime` (no `tflite-runtime`)
+
+### Bluetooth headset setup
+
+```bash
+# Install PulseAudio + Bluetooth
+sudo apt install pulseaudio pulseaudio-module-bluetooth bluez
+
+# Pair your headset
+bluetoothctl
+> scan on
+> pair XX:XX:XX:XX:XX:XX
+> connect XX:XX:XX:XX:XX:XX
+> trust XX:XX:XX:XX:XX:XX
+
+# Verify audio devices
+python -m sounddevice
+# Look for "pulse" device — it should route to your headset
 ```
 
-### OpenClaw → voice-out (`{prefix}/voice/out`)
+### Auto-reconnect tip
 
-```json
-{
-  "text": "Il est 14 heures 30.",
-  "messageId": "mqtt-1234567890-abc123"
-}
-```
+Add `module-switch-on-connect` to PulseAudio to auto-route audio when the headset reconnects:
 
-### Anti-loop mute (`{prefix}/voice/mute`)
-
-```json
-{ "muted": true }
+```bash
+# In /etc/pulse/default.pa or ~/.config/pulse/default.pa
+load-module module-switch-on-connect
 ```
 
 ---
@@ -270,78 +254,56 @@ voice-out                          voice-in
 ## 🔧 Troubleshooting
 
 ### `tflite-runtime` installation fails
-
-**Symptom:** `pip install openwakeword` fails on Python 3.12+
-
-**Solution:** Re-run `./setup.sh`, which installs `openwakeword` with `--no-deps` and uses `onnxruntime` instead.
+Re-run `./setup.sh` — it installs `openwakeword` with `--no-deps` and uses `onnxruntime` instead.
 
 ### No microphone detected
-
-**Symptom:** `sounddevice.PortAudioError: No input device`
-
-**Solution:**
 ```bash
-# Install PortAudio
 sudo apt install portaudio19-dev
-
-# List available devices
-python -m sounddevice
-
-# Set a specific device in config.yaml
-audio:
-  input_device: 2   # Use the index from the list above
+python -m sounddevice            # List devices
+# Set input_device in config.yaml if needed
 ```
 
 ### MQTT connection refused
-
-**Symptom:** `ConnectionRefusedError`
-
-**Solution:** Check that your MQTT broker is running and the URL in `config.yaml` is correct:
-```bash
-# Test connection
-mosquitto_pub -h your-broker.example.com -t test -m "hello"
-```
+Check broker URL and test with: `mosquitto_pub -h broker.example.com -t test -m "hello"`
 
 ### Wake word not detecting
+- Wake words are **English-only** — pronounce "Hey Jarvis" in English
+- Check models are downloaded: `ls ~/.local/share/openwakeword/`
+- Try disabling wake word (`wakeword.enabled: false`)
 
-**Symptom:** Says "Waiting for wake word..." but never triggers
+### Whisper transcribes garbage on silence
+Whisper sometimes hallucinates on silence (e.g., "Sous-titres réalisés par..."). This is a known Whisper behavior — increasing the VAD threshold helps filter out near-silence segments.
 
-**Possible causes:**
-- Speak the wake word clearly in **English** ("Hey Jarvis")
-- Check that models are downloaded: `ls ~/.local/share/openwakeword/`
-- Try lowering background noise
-- Temporarily set `wakeword.enabled: false` to test without it
-
-### Empty transcriptions
-
-**Symptom:** Speech is detected but transcription is empty
-
-**Possible causes:**
-- Check your `OPENAI_API_KEY` is set and valid
-- Increase `silence_threshold_ms` if speech is being cut off
-- Ensure audio input quality is adequate
+### No sound on Bluetooth (RPi)
+- Ensure PulseAudio is running: `pulseaudio --check && echo OK`
+- Check headset is connected: `pactl list sinks short`
+- Restart voice-out after reconnecting the headset
+- Add `module-switch-on-connect` (see RPi section above)
 
 ---
 
 ## 🗺️ Roadmap
 
-- [x] voice-in with OpenAI Whisper API
-- [x] voice-out with OpenAI TTS
-- [x] Anti-loop mute mechanism
+- [x] Voice-in with OpenAI Whisper API
+- [x] Voice-out with OpenAI streaming TTS
+- [x] Silero VAD via ONNX Runtime (RPi-compatible)
 - [x] Wake word detection (OpenWakeWord)
-- [ ] Local ASR with whisper.cpp (asr-worker)
+- [x] Duplex conversation (interrupt while speaking)
+- [x] Raspberry Pi 3 + Bluetooth headset support
+- [x] PulseAudio auto-detection
+- [x] MQTT auto-reconnect
+- [ ] Whisper hallucination filtering
+- [ ] Local ASR with whisper.cpp
 - [ ] Local TTS with Piper
 - [ ] ElevenLabs TTS support
-- [ ] Raspberry Pi optimizations
-- [ ] Duplex conversation (interrupt while speaking)
-- [ ] Web-based audio configuration UI
+- [ ] systemd services for auto-start
 - [ ] Multi-language wake word models
 
 ---
 
 ## 📄 License
 
-[MIT](LICENSE) — do whatever you want with it.
+[MIT](LICENSE)
 
 ---
 
@@ -350,4 +312,3 @@ mosquitto_pub -h your-broker.example.com -t test -m "hello"
 Made with ❤️ for the [OpenClaw](https://github.com/openclaw/openclaw) community
 
 </div>
-]]>
