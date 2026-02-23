@@ -87,9 +87,10 @@ def resolve_audio_device(configured, kind="input"):
 class SileroVAD:
     """Voice Activity Detection using Silero VAD (ONNX Runtime)."""
 
-    def __init__(self, sample_rate: int = 16000):
+    def __init__(self, sample_rate: int = 16000, threshold: float = 0.3):
         import onnxruntime as ort
         self.sample_rate = sample_rate
+        self.threshold = threshold
         model_path = Path(__file__).parent / "models" / "silero_vad.onnx"
         opts = ort.SessionOptions()
         opts.inter_op_num_threads = 1
@@ -114,7 +115,7 @@ class SileroVAD:
         })
         confidence, self._state = out[0], out[1]
         conf = float(confidence.flat[0])
-        return conf > 0.5, conf
+        return conf > self.threshold, conf
 
     def reset(self):
         """Reset VAD state between utterances."""
@@ -258,8 +259,10 @@ STATE_LISTENING = "LISTENING"
 def main():
     cfg = load_config()
 
-    sample_rate = cfg.get("vad", {}).get("sample_rate", 16000)
-    silence_ms = cfg.get("vad", {}).get("silence_threshold_ms", 1500)
+    vad_cfg = cfg.get("vad", {})
+    sample_rate = vad_cfg.get("sample_rate", 16000)
+    silence_ms = vad_cfg.get("silence_threshold_ms", 1500)
+    vad_threshold = vad_cfg.get("threshold", 0.3)
     input_device = cfg.get("audio", {}).get("input_device", None)
 
     # Wake word config
@@ -272,13 +275,14 @@ def main():
     print("═══════════════════════════════════════════")
     print(f"  Sample rate:       {sample_rate} Hz")
     print(f"  Silence threshold: {silence_ms} ms")
+    print(f"  VAD threshold:     {vad_threshold}")
     print(f"  Wake word:         {'ON (' + wakeword_model + ')' if wakeword_enabled else 'OFF'}")
     input_device = resolve_audio_device(input_device, "input")
     print()
 
     # Init components
     print("Loading VAD model...")
-    vad = SileroVAD(sample_rate=sample_rate)
+    vad = SileroVAD(sample_rate=sample_rate, threshold=vad_threshold)
 
     wakeword_detector = None
     if wakeword_enabled:
