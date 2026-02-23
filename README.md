@@ -36,12 +36,14 @@ Talk to your OpenClaw assistant with your voice — from a PC, Raspberry Pi, or 
 ### Install
 
 ```bash
-pip install openwakeword --no-deps
-pip install -r requirements.txt
+./setup.sh
 ```
 
-> **Note:** `openwakeword` requires `tflite-runtime` which doesn't support Python 3.12+ on Linux.
-> Installing it with `--no-deps` and using `onnxruntime` instead works fine.
+This creates a `.venv` virtual environment and installs all dependencies.
+
+> **Note:** `openwakeword` is installed with `--no-deps` because it pulls
+> `tflite-runtime` which doesn't support Python 3.12+ on Linux.
+> `onnxruntime` is used instead.
 
 ### Configure
 
@@ -57,13 +59,15 @@ Edit `config.yaml` with your MQTT broker, topics, and API keys.
 
 Terminal 1 — listen for replies and play them:
 ```bash
-python voice-out/main.py
+.venv/bin/python voice-out/main.py
 ```
 
 Terminal 2 — capture voice and send to OpenClaw:
 ```bash
-python voice-in/main.py
+.venv/bin/python voice-in/main.py
 ```
+
+> Or activate the venv first (`source .venv/bin/activate`) and use `python` directly.
 
 ## Configuration
 
