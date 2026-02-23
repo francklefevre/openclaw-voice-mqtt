@@ -101,8 +101,9 @@ class SileroVAD:
         )
         self._state = np.zeros((2, 1, 128), dtype=np.float32)
 
-    def is_speech(self, audio_chunk: np.ndarray) -> bool:
-        """Check if an audio chunk contains speech."""
+    def is_speech(self, audio_chunk: np.ndarray) -> tuple[bool, float]:
+        """Check if an audio chunk contains speech.
+        Returns (is_speech, confidence)."""
         if audio_chunk.ndim > 1:
             audio_chunk = audio_chunk.mean(axis=1)
         x = audio_chunk.astype(np.float32).reshape(1, -1)
@@ -112,7 +113,8 @@ class SileroVAD:
             "state": self._state,
         })
         confidence, self._state = out[0], out[1]
-        return float(confidence.flat[0]) > 0.5
+        conf = float(confidence.flat[0])
+        return conf > 0.5, conf
 
     def reset(self):
         """Reset VAD state between utterances."""
@@ -341,9 +343,14 @@ def main():
 
         # ── LISTENING state: VAD + ASR ──
         if len(audio) >= chunk_samples:
-            speech_detected = vad.is_speech(audio[:chunk_samples])
+            speech_detected, vad_conf = vad.is_speech(audio[:chunk_samples])
         else:
-            speech_detected = False
+            speech_detected, vad_conf = False, 0.0
+
+        rms = float(np.sqrt(np.mean(audio ** 2)))
+        if rms > 0.01 or speech_detected:
+            print(f"  [audio] rms={rms:.4f} vad={vad_conf:.3f}"
+                  f" {'SPEECH' if speech_detected else ''}")
 
         if speech_detected:
             if not is_speaking:
