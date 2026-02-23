@@ -487,11 +487,25 @@ def main():
                 speech_detected, vad_conf = vad.is_speech(audio[:chunk_samples])
                 if speech_detected:
                     state.interrupt_count += 1
+                    # Buffer audio from the very first detection
+                    audio_buffer.append(audio)
+                    # Interrupt playback after sustained speech
                     if state.interrupt_count >= interrupt_threshold:
                         state.interrupt()
                         state.interrupt_count = 0
+                        # Transition to LISTENING with buffer intact
+                        is_speaking = True
+                        silence_count = 0
+                        # Don't return — let it fall through to LISTENING
+                        # next callback will continue recording
+                        return
                 else:
-                    state.interrupt_count = 0
+                    # Allow small gaps — decay instead of hard reset
+                    if state.interrupt_count > 0:
+                        audio_buffer.append(audio)  # keep recording during gaps
+                        state.interrupt_count = max(0, state.interrupt_count - 1)
+                        if state.interrupt_count == 0:
+                            audio_buffer.clear()
             return
 
         # ── IDLE: wake word detection ──
