@@ -123,54 +123,27 @@ class AudioPlayer:
         self._lock = threading.Lock()
 
     def play_stream(self, pcm_chunks):
-        """Play PCM chunks as they arrive — minimal latency."""
-        import queue
-
-        audio_queue = queue.Queue()
-        finished = threading.Event()
+        """Collect streaming PCM chunks then play.
+        The streaming happens on the network side (faster than waiting
+        for the full API response), but playback uses sd.play() which
+        is reliable on all audio backends including Bluetooth."""
+        chunks = []
         total_bytes = 0
 
-        def callback(outdata, frames, time_info, status):
-            try:
-                data = audio_queue.get_nowait()
-            except queue.Empty:
-                if finished.is_set():
-                    raise sd.CallbackStop
-                outdata[:] = np.zeros((frames, 1), dtype=np.float32)
-                return
-            audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32767.0
-            # Pad or trim to match frame size
-            if len(audio) < frames:
-                padded = np.zeros(frames, dtype=np.float32)
-                padded[:len(audio)] = audio
-                outdata[:, 0] = padded
-            else:
-                outdata[:, 0] = audio[:frames]
+        for chunk in pcm_chunks:
+            chunks.append(chunk)
+            total_bytes += len(chunk)
+            if total_bytes == len(chunk):
+                print(f"  ⚡ First chunk received — buffering stream...")
 
-        frames_per_chunk = 2400  # 100ms at 24kHz
+        if not chunks:
+            return 0
 
+        print(f"  ▶️  Playing ({total_bytes} bytes)")
         with self._lock:
-            stream = sd.OutputStream(
-                samplerate=self.sample_rate,
-                channels=1,
-                dtype="float32",
-                blocksize=frames_per_chunk,
-                device=self.output_device,
-                callback=callback,
-            )
-            with stream:
-                first_chunk = True
-                for chunk in pcm_chunks:
-                    if first_chunk:
-                        print(f"  ▶️  First audio chunk — playing!")
-                        first_chunk = True
-                    audio_queue.put(chunk)
-                    total_bytes += len(chunk)
-                finished.set()
-                # Wait for queue to drain
-                while not audio_queue.empty():
-                    sd.sleep(50)
-                sd.sleep(200)  # small tail buffer
+            all_audio = np.frombuffer(b"".join(chunks), dtype=np.int16).astype(np.float32) / 32767.0
+            sd.play(all_audio, samplerate=self.sample_rate, device=self.output_device)
+            sd.wait()
 
         return total_bytes
 
