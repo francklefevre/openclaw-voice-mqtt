@@ -55,7 +55,8 @@ def _expand_env(obj):
 # ── Audio device helper ────────────────────────────────────────────────────
 
 def resolve_audio_device(configured, kind="input"):
-    """Resolve audio device: try configured value, fall back to system default.
+    """Resolve audio device: try configured value, fall back to PulseAudio
+    'pulse' device (if available), then system default.
     kind is 'input' or 'output'."""
     if configured is not None:
         try:
@@ -63,7 +64,15 @@ def resolve_audio_device(configured, kind="input"):
             print(f"  Audio {kind}: #{info['index']} — {info['name']}")
             return configured
         except ValueError:
-            print(f"  WARNING: {kind} device {configured!r} not found, falling back to default")
+            print(f"  WARNING: {kind} device {configured!r} not found")
+    # Prefer 'pulse' device — routes through PulseAudio/PipeWire and
+    # respects pactl default source/sink (ALSA 'default' bypasses PA).
+    try:
+        info = sd.query_devices("pulse", kind)
+        print(f"  Audio {kind}: #{info['index']} — {info['name']} (pulse)")
+        return "pulse"
+    except ValueError:
+        pass
     default = sd.default.device[0 if kind == "input" else 1]
     try:
         info = sd.query_devices(default, kind)
