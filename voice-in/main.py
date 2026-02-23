@@ -82,7 +82,7 @@ class SileroVAD:
             "state": self._state,
         })
         confidence, self._state = out[0], out[1]
-        return float(confidence) > 0.5
+        return float(confidence.flat[0]) > 0.5
 
     def reset(self):
         """Reset VAD state between utterances."""
