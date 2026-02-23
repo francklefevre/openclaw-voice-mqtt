@@ -192,11 +192,13 @@ class VoiceState:
     def __init__(self):
         self.is_speaking = False          # True while TTS is playing
         self.interrupted = threading.Event()
+        self.interrupt_count = 0          # consecutive speech chunks during playback
         self._lock = threading.Lock()
 
     def start_speaking(self):
         with self._lock:
             self.interrupted.clear()
+            self.interrupt_count = 0
             self.is_speaking = True
         print(f"  🔊 Speaking...")
 
@@ -403,7 +405,11 @@ def main():
     print(f"  Sample rate:       {sample_rate} Hz")
     print(f"  Silence threshold: {silence_ms} ms")
     print(f"  VAD threshold:     {vad_threshold}")
+    # Interrupt needs N consecutive speech chunks (~N*32ms) to trigger
+    interrupt_threshold = vad_cfg.get("interrupt_chunks", 5)  # ~160ms of sustained speech
+
     print(f"  Wake word:         {'ON (' + wakeword_model + ')' if wakeword_enabled else 'OFF'}")
+    print(f"  Interrupt after:   {interrupt_threshold} chunks (~{interrupt_threshold * 32}ms of speech)")
     input_device = resolve_audio_device(input_device, "input")
     output_device = resolve_audio_device(output_device, "output")
     print()
@@ -475,12 +481,17 @@ def main():
 
         audio = indata[:, 0].copy()
 
-        # ── Duplex: interrupt if speaking and voice detected ──
+        # ── Duplex: interrupt if speaking and sustained speech detected ──
         if state.is_speaking:
             if len(audio) >= chunk_samples:
-                speech_detected, _ = vad.is_speech(audio[:chunk_samples])
+                speech_detected, vad_conf = vad.is_speech(audio[:chunk_samples])
                 if speech_detected:
-                    state.interrupt()
+                    state.interrupt_count += 1
+                    if state.interrupt_count >= interrupt_threshold:
+                        state.interrupt()
+                        state.interrupt_count = 0
+                else:
+                    state.interrupt_count = 0
             return
 
         # ── IDLE: wake word detection ──
