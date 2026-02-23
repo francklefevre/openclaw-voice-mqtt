@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 voice-out: Subscribe to MQTT reply topic, convert text to speech via TTS API,
-and play audio on the local speaker.
+and play audio on the local speaker. Supports duplex interruption.
 """
 
 import io
@@ -52,8 +52,7 @@ def _expand_env(obj):
 
 def resolve_audio_device(configured, kind="output"):
     """Resolve audio device: try configured value, fall back to PulseAudio
-    'pulse' device (if available), then system default.
-    kind is 'input' or 'output'."""
+    'pulse' device (if available), then system default."""
     if configured is not None:
         try:
             info = sd.query_devices(configured, kind)
@@ -61,8 +60,6 @@ def resolve_audio_device(configured, kind="output"):
             return configured
         except ValueError:
             print(f"  WARNING: {kind} device {configured!r} not found")
-    # Prefer 'pulse' device — routes through PulseAudio/PipeWire and
-    # respects pactl default source/sink (ALSA 'default' bypasses PA).
     try:
         info = sd.query_devices("pulse", kind)
         print(f"  Audio {kind}: #{info['index']} — {info['name']} (pulse)")
@@ -95,9 +92,9 @@ class OpenAITTS:
             model=self.model,
             voice=self.voice,
             input=text,
-            response_format="pcm",  # Raw 24kHz 16-bit mono PCM
+            response_format="pcm",
         ) as response:
-            for chunk in response.iter_bytes(chunk_size=4800):  # 100ms at 24kHz 16-bit mono
+            for chunk in response.iter_bytes(chunk_size=4800):
                 if chunk:
                     yield chunk
 
@@ -112,57 +109,82 @@ class OpenAITTS:
         return response.read()
 
 
-# ── Streaming Audio Player ──────────────────────────────────────────────────
+# ── Interruptible Audio Player ──────────────────────────────────────────────
 
 class AudioPlayer:
-    """Play PCM audio on the local speaker, supporting streaming playback."""
+    """Play PCM audio with support for interruption (duplex mode)."""
 
     def __init__(self, output_device=None):
         self.output_device = output_device
         self.sample_rate = 24000  # OpenAI TTS outputs 24kHz
         self._lock = threading.Lock()
+        self.interrupted = threading.Event()
+        self.is_playing = threading.Event()
+
+    def interrupt(self):
+        """Interrupt current playback immediately."""
+        if self.is_playing.is_set():
+            self.interrupted.set()
+            sd.stop()
+            print(f"  ⏹️  Playback interrupted!")
 
     def play_stream(self, pcm_chunks):
-        """Collect streaming PCM chunks then play.
-        The streaming happens on the network side (faster than waiting
-        for the full API response), but playback uses sd.play() which
-        is reliable on all audio backends including Bluetooth."""
+        """Collect streaming PCM chunks then play. Can be interrupted."""
+        self.interrupted.clear()
         chunks = []
         total_bytes = 0
 
         for chunk in pcm_chunks:
+            if self.interrupted.is_set():
+                print(f"  ⏹️  Stream interrupted during download")
+                return total_bytes
             chunks.append(chunk)
             total_bytes += len(chunk)
             if total_bytes == len(chunk):
                 print(f"  ⚡ First chunk received — buffering stream...")
 
-        if not chunks:
-            return 0
+        if not chunks or self.interrupted.is_set():
+            return total_bytes
 
         print(f"  ▶️  Playing ({total_bytes} bytes)")
         with self._lock:
             all_audio = np.frombuffer(b"".join(chunks), dtype=np.int16).astype(np.float32) / 32767.0
+            self.is_playing.set()
             sd.play(all_audio, samplerate=self.sample_rate, device=self.output_device)
-            sd.wait()
+            # Wait but check for interruption periodically
+            while sd.get_stream().active:
+                if self.interrupted.is_set():
+                    sd.stop()
+                    break
+                sd.sleep(50)
+            self.is_playing.clear()
 
         return total_bytes
 
     def play(self, pcm_data: bytes):
         """Play full PCM audio (non-streaming fallback)."""
+        self.interrupted.clear()
         with self._lock:
             audio = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32) / 32767.0
+            self.is_playing.set()
             sd.play(audio, samplerate=self.sample_rate, device=self.output_device)
-            sd.wait()
+            while sd.get_stream().active:
+                if self.interrupted.is_set():
+                    sd.stop()
+                    break
+                sd.sleep(50)
+            self.is_playing.clear()
 
 
 # ── MQTT Subscriber ─────────────────────────────────────────────────────────
 
 class VoiceOutSubscriber:
-    """Subscribe to MQTT and play incoming text as speech."""
+    """Subscribe to MQTT and play incoming text as speech. Supports duplex interruption."""
 
     def __init__(self, broker: str, topic: str, topic_prefix: str, tts: OpenAITTS, player: AudioPlayer):
         self.topic = topic
-        self.mute_topic = f"{topic_prefix}/voice/mute"
+        self.interrupt_topic = f"{topic_prefix}/voice/interrupt"
+        self.speaking_topic = f"{topic_prefix}/voice/speaking"
         self.tts = tts
         self.player = player
 
@@ -183,14 +205,16 @@ class VoiceOutSubscriber:
         self.client.connect(host, port, keepalive=60)
 
         print(f"MQTT connected to {host}:{port}")
-        print(f"  Subscribed to: {self.topic}")
-        print(f"  Mute topic:    {self.mute_topic}")
+        print(f"  Reply topic:     {self.topic}")
+        print(f"  Interrupt topic: {self.interrupt_topic}")
+        print(f"  Speaking topic:  {self.speaking_topic}")
 
     def _on_connect(self, client, userdata, flags, rc, properties=None):
-        """Subscribe on (re)connect — this fires on every reconnect too."""
+        """Subscribe on (re)connect."""
         print(f"  🟢 MQTT connected (rc={rc})")
         client.subscribe(self.topic)
-        print(f"  📡 Resubscribed to {self.topic}")
+        client.subscribe(self.interrupt_topic)
+        print(f"  📡 Subscribed to {self.topic} + {self.interrupt_topic}")
 
     def _on_disconnect(self, client, userdata, flags, rc, properties=None):
         """Log disconnections."""
@@ -200,8 +224,15 @@ class VoiceOutSubscriber:
             print(f"  ⚪ MQTT disconnected cleanly")
 
     def _on_message(self, client, userdata, msg):
-        """Handle incoming MQTT message."""
+        """Handle incoming MQTT messages."""
         try:
+            # Handle interrupt signal
+            if msg.topic == self.interrupt_topic:
+                print(f"  🛑 Interrupt received!")
+                self.player.interrupt()
+                return
+
+            # Handle reply text
             raw = msg.payload.decode("utf-8")
             try:
                 parsed = json.loads(raw)
@@ -213,22 +244,24 @@ class VoiceOutSubscriber:
                 return
 
             print(f"  📩 Received: \"{text}\"")
-            print(f"  🔊 Synthesizing speech...")
 
             # TTS + streaming playback in a thread to not block MQTT
             def do_speak(t):
                 try:
-                    # Mute voice-in before playback to prevent audio loop
-                    self.client.publish(self.mute_topic, json.dumps({"muted": True}))
+                    # Signal that we're speaking
+                    self.client.publish(self.speaking_topic, json.dumps({"speaking": True}))
                     print(f"  🎵 Streaming TTS...")
                     pcm_stream = self.tts.synthesize_stream(t)
                     total = self.player.play_stream(pcm_stream)
-                    print(f"  ✅ Done ({total} bytes streamed)")
-                    # Unmute voice-in after playback
-                    self.client.publish(self.mute_topic, json.dumps({"muted": False}))
+                    was_interrupted = self.player.interrupted.is_set()
+                    # Signal that we're done
+                    self.client.publish(self.speaking_topic, json.dumps({"speaking": False}))
+                    if was_interrupted:
+                        print(f"  ⏹️  Interrupted after {total} bytes")
+                    else:
+                        print(f"  ✅ Done ({total} bytes streamed)")
                 except Exception as e:
-                    # Always unmute on error
-                    self.client.publish(self.mute_topic, json.dumps({"muted": False}))
+                    self.client.publish(self.speaking_topic, json.dumps({"speaking": False}))
                     print(f"  ❌ TTS/playback error: {e}", file=sys.stderr)
 
             threading.Thread(target=do_speak, args=(text,), daemon=True).start()
@@ -253,6 +286,7 @@ def main():
 
     print("═══════════════════════════════════════════")
     print("  voice-out 🔊 — OpenClaw Voice Frontend")
+    print("  Mode: duplex (interruptible)")
     print("═══════════════════════════════════════════")
     output_device = resolve_audio_device(output_device, "output")
     print()
@@ -285,6 +319,7 @@ def main():
 
     print()
     print("👂 Waiting for replies... (Ctrl+C to stop)")
+    print("💡 Say something while I'm speaking to interrupt me!")
     print()
 
     try:

@@ -194,14 +194,15 @@ class WhisperASR:
 # ── MQTT Publisher ──────────────────────────────────────────────────────────
 
 class MQTTPublisher:
-    """Publish transcribed text to MQTT and subscribe to mute topic."""
+    """Publish transcribed text to MQTT. Supports duplex interruption."""
 
     def __init__(self, broker: str, topic_prefix: str):
         self.topic_in = f"{topic_prefix}/in"
         self.reply_topic = f"{topic_prefix}/voice/out"
-        self.mute_topic = f"{topic_prefix}/voice/mute"
-        self.muted = False
-        self._mute_lock = threading.Lock()
+        self.speaking_topic = f"{topic_prefix}/voice/speaking"
+        self.interrupt_topic = f"{topic_prefix}/voice/interrupt"
+        self._speaking = False
+        self._speaking_lock = threading.Lock()
 
         # Parse broker URL
         broker_clean = broker.replace("mqtt://", "").replace("mqtts://", "")
@@ -220,14 +221,15 @@ class MQTTPublisher:
         self.client.connect(host, port, keepalive=60)
         self.client.loop_start()
         print(f"MQTT connected to {host}:{port}")
-        print(f"  Publishing to: {self.topic_in}")
-        print(f"  Reply topic:   {self.reply_topic}")
-        print(f"  Mute topic:    {self.mute_topic}")
+        print(f"  Publishing to:    {self.topic_in}")
+        print(f"  Reply topic:      {self.reply_topic}")
+        print(f"  Speaking topic:   {self.speaking_topic}")
+        print(f"  Interrupt topic:  {self.interrupt_topic}")
 
     def _on_connect(self, client, userdata, flags, rc, properties=None):
-        """Subscribe to mute topic on (re)connect."""
+        """Subscribe to speaking topic on (re)connect."""
         print(f"  🟢 MQTT connected (rc={rc})")
-        client.subscribe(self.mute_topic)
+        client.subscribe(self.speaking_topic)
 
     def _on_disconnect(self, client, userdata, flags, rc, properties=None):
         """Log disconnections."""
@@ -237,21 +239,26 @@ class MQTTPublisher:
             print(f"  ⚪ MQTT disconnected cleanly")
 
     def _on_message(self, client, userdata, msg):
-        """Handle mute/unmute messages."""
+        """Handle speaking state messages from voice-out."""
         try:
             payload = json.loads(msg.payload.decode("utf-8"))
-            muted = payload.get("muted", False)
-            with self._mute_lock:
-                self.muted = muted
-            state = "🔇 MUTED" if muted else "🔊 UNMUTED"
-            print(f"  {state} (anti-loop)")
+            speaking = payload.get("speaking", False)
+            with self._speaking_lock:
+                self._speaking = speaking
+            state = "🔊 voice-out SPEAKING" if speaking else "🔇 voice-out SILENT"
+            print(f"  {state}")
         except Exception as e:
-            print(f"  ⚠ Mute message error: {e}", file=sys.stderr)
+            print(f"  ⚠ Speaking message error: {e}", file=sys.stderr)
 
     @property
-    def is_muted(self) -> bool:
-        with self._mute_lock:
-            return self.muted
+    def voice_out_speaking(self) -> bool:
+        with self._speaking_lock:
+            return self._speaking
+
+    def send_interrupt(self):
+        """Send interrupt signal to voice-out to stop playback."""
+        print(f"  🛑 Sending interrupt to voice-out!")
+        self.client.publish(self.interrupt_topic, json.dumps({"interrupt": True}))
 
     def publish(self, text: str):
         """Publish transcribed text to MQTT."""
@@ -347,11 +354,15 @@ def main():
         if status:
             print(f"  ⚠ Audio: {status}", file=sys.stderr)
 
-        # Ignore audio when muted (voice-out is playing)
-        if publisher.is_muted:
-            return
-
         audio = indata[:, 0].copy()  # mono
+
+        # Duplex: if voice-out is speaking and we detect speech, interrupt it
+        if publisher.voice_out_speaking:
+            if len(audio) >= chunk_samples:
+                speech_detected, vad_conf = vad.is_speech(audio[:chunk_samples])
+                if speech_detected:
+                    publisher.send_interrupt()
+            return
 
         # ── IDLE state: only listen for wake word ──
         if state == STATE_IDLE and wakeword_detector is not None:
