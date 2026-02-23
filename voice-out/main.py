@@ -81,7 +81,7 @@ def resolve_audio_device(configured, kind="output"):
 # ── TTS (OpenAI) ───────────────────────────────────────────────────────────
 
 class OpenAITTS:
-    """Text-to-Speech using OpenAI API."""
+    """Text-to-Speech using OpenAI API with streaming support."""
 
     def __init__(self, api_key: str, model: str = "tts-1", voice: str = "nova"):
         from openai import OpenAI
@@ -89,29 +89,93 @@ class OpenAITTS:
         self.model = model
         self.voice = voice
 
-    def synthesize(self, text: str) -> bytes:
-        """Convert text to audio bytes (PCM)."""
-        response = self.client.audio.speech.create(
+    def synthesize_stream(self, text: str):
+        """Stream TTS audio as PCM chunks. Yields raw bytes as they arrive."""
+        with self.client.audio.speech.with_streaming_response.create(
             model=self.model,
             voice=self.voice,
             input=text,
             response_format="pcm",  # Raw 24kHz 16-bit mono PCM
+        ) as response:
+            for chunk in response.iter_bytes(chunk_size=4800):  # 100ms at 24kHz 16-bit mono
+                if chunk:
+                    yield chunk
+
+    def synthesize(self, text: str) -> bytes:
+        """Non-streaming fallback: full audio at once."""
+        response = self.client.audio.speech.create(
+            model=self.model,
+            voice=self.voice,
+            input=text,
+            response_format="pcm",
         )
         return response.read()
 
 
-# ── Audio Player ────────────────────────────────────────────────────────────
+# ── Streaming Audio Player ──────────────────────────────────────────────────
 
 class AudioPlayer:
-    """Play PCM audio on the local speaker."""
+    """Play PCM audio on the local speaker, supporting streaming playback."""
 
     def __init__(self, output_device=None):
         self.output_device = output_device
         self.sample_rate = 24000  # OpenAI TTS outputs 24kHz
         self._lock = threading.Lock()
 
+    def play_stream(self, pcm_chunks):
+        """Play PCM chunks as they arrive — minimal latency."""
+        import queue
+
+        audio_queue = queue.Queue()
+        finished = threading.Event()
+        total_bytes = 0
+
+        def callback(outdata, frames, time_info, status):
+            try:
+                data = audio_queue.get_nowait()
+            except queue.Empty:
+                if finished.is_set():
+                    raise sd.CallbackStop
+                outdata[:] = np.zeros((frames, 1), dtype=np.float32)
+                return
+            audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32767.0
+            # Pad or trim to match frame size
+            if len(audio) < frames:
+                padded = np.zeros(frames, dtype=np.float32)
+                padded[:len(audio)] = audio
+                outdata[:, 0] = padded
+            else:
+                outdata[:, 0] = audio[:frames]
+
+        frames_per_chunk = 2400  # 100ms at 24kHz
+
+        with self._lock:
+            stream = sd.OutputStream(
+                samplerate=self.sample_rate,
+                channels=1,
+                dtype="float32",
+                blocksize=frames_per_chunk,
+                device=self.output_device,
+                callback=callback,
+            )
+            with stream:
+                first_chunk = True
+                for chunk in pcm_chunks:
+                    if first_chunk:
+                        print(f"  ▶️  First audio chunk — playing!")
+                        first_chunk = True
+                    audio_queue.put(chunk)
+                    total_bytes += len(chunk)
+                finished.set()
+                # Wait for queue to drain
+                while not audio_queue.empty():
+                    sd.sleep(50)
+                sd.sleep(200)  # small tail buffer
+
+        return total_bytes
+
     def play(self, pcm_data: bytes):
-        """Play raw PCM audio (24kHz, 16-bit, mono)."""
+        """Play full PCM audio (non-streaming fallback)."""
         with self._lock:
             audio = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32) / 32767.0
             sd.play(audio, samplerate=self.sample_rate, device=self.output_device)
@@ -178,17 +242,17 @@ class VoiceOutSubscriber:
             print(f"  📩 Received: \"{text}\"")
             print(f"  🔊 Synthesizing speech...")
 
-            # TTS + playback in a thread to not block MQTT
+            # TTS + streaming playback in a thread to not block MQTT
             def do_speak(t):
                 try:
-                    pcm = self.tts.synthesize(t)
-                    print(f"  ▶️  Playing ({len(pcm)} bytes)")
                     # Mute voice-in before playback to prevent audio loop
                     self.client.publish(self.mute_topic, json.dumps({"muted": True}))
-                    self.player.play(pcm)
+                    print(f"  🎵 Streaming TTS...")
+                    pcm_stream = self.tts.synthesize_stream(t)
+                    total = self.player.play_stream(pcm_stream)
+                    print(f"  ✅ Done ({total} bytes streamed)")
                     # Unmute voice-in after playback
                     self.client.publish(self.mute_topic, json.dumps({"muted": False}))
-                    print(f"  ✅ Done")
                 except Exception as e:
                     # Always unmute on error
                     self.client.publish(self.mute_topic, json.dumps({"muted": False}))
